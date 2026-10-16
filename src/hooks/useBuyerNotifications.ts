@@ -1,16 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWallet } from "@/hooks/useWallet";
 
+export type BuyerNotificationType =
+  | "prompt_update"
+  | "purchase_receipt"
+  | "security_alert"
+  | "account_lifecycle"
+  | "entitlement_update"
+  | "support_access_notice";
+
 export interface BuyerNotification {
   _id: string;
   recipientWallet: string;
   promptId: string;
   promptTitle: string;
-  type: "prompt_update";
+  type: BuyerNotificationType;
   message: string;
   versionIndex: number;
   changeNote: string;
   read: boolean;
+  /**
+   * Present on alerts that ignore notification preferences. Optional so
+   * responses from older server versions still parse.
+   */
+  mandatory?: boolean;
   createdAt: string;
   updatedAt: string;
 }

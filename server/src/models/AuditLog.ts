@@ -14,7 +14,13 @@ export type AuditAction =
   | "unlock_ledger_failure"
   | "unlock_stale_quote"
   | "admin_auth_success"
-  | "admin_auth_denied";
+  | "admin_auth_denied"
+  | "notification_preference_updated"
+  | "notification_mandatory_delivered"
+  | "support_access_granted"
+  | "support_access_revoked"
+  | "support_access_used"
+  | "support_access_denied";
 
 export type AuditResult = "success" | "failure" | "blocked";
 
@@ -38,6 +44,12 @@ const auditLogSchema = new mongoose.Schema(
         "unlock_stale_quote",
         "admin_auth_success",
         "admin_auth_denied",
+        "notification_preference_updated",
+        "notification_mandatory_delivered",
+        "support_access_granted",
+        "support_access_revoked",
+        "support_access_used",
+        "support_access_denied",
       ] as AuditAction[],
       index: true,
     },
