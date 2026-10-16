@@ -36,7 +36,7 @@ export const NETWORK_PASSPHRASES = {
   LOCAL: "Standalone Network ; February 2017",
 };
 
-const REQUIRED_ENV = [
+export const REQUIRED_ENV = [
   "STELLAR_SCAFFOLD_ENV",
   "PUBLIC_STELLAR_NETWORK",
   "PUBLIC_STELLAR_NETWORK_PASSPHRASE",
@@ -60,7 +60,7 @@ const SECRET_ENV = [
   "RECEIPT_SIGNING_PRIVATE_KEY",
 ];
 
-const PLACEHOLDER = [/^replace-with/i, /^BASE64_/i, /^[CG]X{10,}/, /^[CG]A{55}$/, /^your-/i, /^<.*>$/];
+const PLACEHOLDER = [/^replace-with/i, /^BASE64_/i, /^[CG]X{10,}/, /^[CG]A{55}$/, /^your[-_]/i, /_here$/i, /^<.*>$/];
 const CONTRACT_ID = /^C[A-Z2-7]{55}$/;
 const ACCOUNT_ID = /^G[A-Z2-7]{55}$/;
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -120,7 +120,9 @@ export function parseVersion(raw) {
 
 export function normalizeNetwork(value) {
   const n = String(value ?? "").trim().toUpperCase();
-  return n === "MAINNET" ? "PUBLIC" : n;
+  // The frontend (src/lib/env.ts) treats STANDALONE as a deprecated alias of LOCAL.
+  // MAINNET is deliberately NOT an alias: the frontend schema rejects it.
+  return n === "STANDALONE" ? "LOCAL" : n;
 }
 
 /** Classify an endpoint URL by the network its hostname implies, or null if unknown. */
@@ -278,7 +280,7 @@ export function checkEnvironment(env, ctx = {}) {
   // Cross-variable consistency.
   const network = normalizeNetwork(env.PUBLIC_STELLAR_NETWORK);
   if (env.PUBLIC_STELLAR_NETWORK && !NETWORK_PASSPHRASES[network]) {
-    bad("PUBLIC_STELLAR_NETWORK", "use TESTNET, PUBLIC (MAINNET), FUTURENET, or LOCAL");
+    bad("PUBLIC_STELLAR_NETWORK", "use TESTNET, PUBLIC, FUTURENET, or LOCAL (MAINNET is rejected by the frontend)");
   } else if (network && env.PUBLIC_STELLAR_NETWORK_PASSPHRASE) {
     out.push(
       env.PUBLIC_STELLAR_NETWORK_PASSPHRASE === NETWORK_PASSPHRASES[network]

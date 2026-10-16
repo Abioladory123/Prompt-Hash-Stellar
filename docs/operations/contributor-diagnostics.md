@@ -49,7 +49,7 @@ Every warning/failure prints a `→` fix. The catalog lives in `FIXES` in `scrip
 - **Offline / air-gapped**: use `--offline`; network checks report `skip`, which never fails the run.
 - **Slow networks**: each probe times out after 5 seconds and reports a timeout instead of hanging.
 - **Placeholder contract ID**: `C` followed by 55 `A`s (shipped in `.env.example`) is treated as unset, so a fresh clone fails until a contract is deployed (`./scripts/deploy.sh`).
-- **`MAINNET`** is accepted as an alias for `PUBLIC`.
+- **`MAINNET`** is rejected: the frontend schema only accepts `PUBLIC`, `FUTURENET`, `TESTNET`, `LOCAL` (and deprecated `STANDALONE`).
 - **Self-hosted RPC** with a neutral hostname cannot be classified from the URL; the `getNetwork` passphrase probe still catches a mismatch.
 - **Ledger-level checks** (contract actually deployed, account funded) are intentionally out of scope; use `yarn verify:smoke`.
 

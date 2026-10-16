@@ -74,16 +74,17 @@ describe("checkEnvironment", () => {
     expect(fails).toHaveLength(2);
   });
 
-  it("accepts MAINNET as an alias of PUBLIC", () => {
+  it("accepts PUBLIC for mainnet and rejects the MAINNET spelling", () => {
     const env = {
       ...goodEnv,
-      PUBLIC_STELLAR_NETWORK: "MAINNET",
+      PUBLIC_STELLAR_NETWORK: "PUBLIC",
       PUBLIC_STELLAR_NETWORK_PASSPHRASE: NETWORK_PASSPHRASES.PUBLIC,
       PUBLIC_STELLAR_RPC_URL: "https://mainnet.sorobanrpc.com",
       PUBLIC_STELLAR_HORIZON_URL: "https://horizon.stellar.org",
       STELLAR_SCAFFOLD_ENV: "production",
     };
     expect(ids(checkEnvironment(env), "fail")).toEqual([]);
+    expect(ids(checkEnvironment({ ...env, PUBLIC_STELLAR_NETWORK: "MAINNET" }), "fail")).toContain("env.format");
   });
 
   it("fails when frontend and serverless unlock public keys differ", () => {
