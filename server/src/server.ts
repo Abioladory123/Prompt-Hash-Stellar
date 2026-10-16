@@ -30,6 +30,7 @@ import { maintenanceBannerRouter } from "./routes/maintenanceBannerRoutes";
 import { externalIdentityRouter } from "./routes/externalIdentityRoutes";
 import { abuseRiskRouter } from "./routes/abuseRiskRoutes";
 import { retentionHoldRouter } from "./routes/retentionHoldRoutes";
+import { lifecycleCaptureRouter, lifecycleReportRouter } from "./routes/lifecycleAnalyticsRoutes";
 import {
   GetOpenApiSchema,
   GetOpenApiExplorer,
@@ -89,6 +90,8 @@ app.use("/api/recovery", operationRecoveryRouter);
 app.use("/api/receipts", receiptRouter);
 app.use("/api/admin/abuse-risk", abuseRiskRouter);
 app.use("/api/admin/retention-holds", retentionHoldRouter);
+app.use("/api/analytics/lifecycle", lifecycleCaptureRouter);
+app.use("/api/admin/lifecycle-analytics", lifecycleReportRouter);
 
 // Apply correlation ID middleware to all routes
 app.use(correlationMiddleware);
