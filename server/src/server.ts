@@ -28,6 +28,7 @@ import { operationRecoveryRouter } from "./routes/operationRecoveryRoutes";
 import { receiptRouter } from "./routes/receiptRoutes";
 import { maintenanceBannerRouter } from "./routes/maintenanceBannerRoutes";
 import { externalIdentityRouter } from "./routes/externalIdentityRoutes";
+import { abuseRiskRouter } from "./routes/abuseRiskRoutes";
 import {
   GetOpenApiSchema,
   GetOpenApiExplorer,
@@ -85,6 +86,7 @@ app.use("/api/admin/dr", drRouter);
 app.use("/api/admin/policy-limits", policyLimitRouter);
 app.use("/api/recovery", operationRecoveryRouter);
 app.use("/api/receipts", receiptRouter);
+app.use("/api/admin/abuse-risk", abuseRiskRouter);
 
 // Apply correlation ID middleware to all routes
 app.use(correlationMiddleware);

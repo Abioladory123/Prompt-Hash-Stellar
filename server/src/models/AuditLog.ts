@@ -62,6 +62,10 @@ export const AUDIT_ACTIONS = [
   "moderation.override",
   "identity_link",
   "identity_unlink",
+  // risk-scored abuse detection
+  "abuse_risk_decision",
+  "abuse_risk_review_resolved",
+  "abuse_risk_subject_reset",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
