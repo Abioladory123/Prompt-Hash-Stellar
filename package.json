@@ -28,6 +28,7 @@
     "format": "prettier . --write",
     "prepare": "node -e \"try { require('fs').existsSync('.husky/') && process.exit(0) } catch(e) {}\" && husky || true",
     "check:setup": "node scripts/check-local-setup.mjs",
+    "diagnose": "node scripts/contributor-diagnostics.mjs",
     "check:policy": "node scripts/policy-scanner.mjs",
     "check:ttl": "node scripts/check-ttl-readiness.mjs",
     "renew:ttl": "node scripts/renew-critical-keys.mjs",
