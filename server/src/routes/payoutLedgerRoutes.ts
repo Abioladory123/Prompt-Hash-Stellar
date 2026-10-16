@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import connectDb from "../db/connectDb";
 import { requireAdminScope } from "../middleware/adminAuth";
+import { requireIdempotency } from "../middleware/idempotency";
 import {
   recordLedgerEntry,
   getCreatorPayoutSummaryView,
@@ -20,7 +21,7 @@ payoutLedgerRouter.get(
   async (req: Request, res: Response) => {
     try {
       await connectDb();
-      const { walletAddress } = req.params;
+      const walletAddress = String(req.params.walletAddress);
       if (!walletAddress) {
         return res.status(400).json({ error: "walletAddress is required" });
       }
@@ -119,6 +120,7 @@ payoutLedgerRouter.get(
 payoutLedgerRouter.post(
   "/entry",
   requireAdminScope("payouts:write"),
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
       await connectDb();

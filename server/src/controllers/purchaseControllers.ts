@@ -18,8 +18,8 @@ import {
   type PayoutStatementLine,
   type PayoutStatementSummary,
 } from "../services/payoutReconciliation";
-import { aggregateSellerAnalytics } from "../../../src/lib/analytics/sellerAnalytics.js";
-import type { SellerEvent } from "../../../src/lib/analytics/sellerAnalytics.js";
+import { aggregateSellerAnalytics } from "../utils/sellerAnalytics";
+import type { SellerEvent } from "../utils/sellerAnalytics";
 
 interface PromptLite {
   _id: unknown;
@@ -476,7 +476,7 @@ export const GetIntegrityReport = async (
     markPrivate(res);
     await connectDb();
     const { runContentIntegrityCheckAll } = await import(
-      "../services/contentIntegrity"
+      "../services/contentIntegrity.js"
     );
     const report = await runContentIntegrityCheckAll();
     return res.json(report);
@@ -499,7 +499,7 @@ export const TriggerIntegrityCheck = async (
   try {
     await connectDb();
     const { verifyPromptIntegrity, runContentIntegrityCheckAll } = await import(
-      "../services/contentIntegrity"
+      "../services/contentIntegrity.js"
     );
     const { promptId } = req.body || {};
 

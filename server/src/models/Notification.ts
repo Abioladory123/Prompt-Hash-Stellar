@@ -1,3 +1,19 @@
+/**
+ * Notification model — in-app notification center (#notification-center).
+ *
+ * Design decisions:
+ *  - `idempotencyKey` (unique sparse index) prevents duplicate notifications
+ *    from retried events; callers pass the on-chain event id as the key.
+ *  - `type` covers all high-impact marketplace events for buyers, creators,
+ *    and admins. `prompt_update` is kept for backward compatibility.
+ *  - `deepLink` is an opaque relative path (e.g. `/prompts/abc123`) so the
+ *    frontend can navigate without re-parsing notification data.
+ *  - Sensitive payload details (wallet keys, prices, addresses) must never
+ *    be stored here. Use reference IDs only.
+ *  - A TTL index on `createdAt` enforces the 90-day retention policy so the
+ *    collection does not grow unbounded. Audit-relevant facts live in AuditLog.
+ */
+
 import mongoose from "mongoose";
 
 /**
@@ -74,10 +90,27 @@ const notificationSchema = new mongoose.Schema(
       required: true,
       enum: NOTIFICATION_TYPES,
     },
+    // Human-readable message. Must not contain sensitive payload data.
     message: {
       type: String,
       required: true,
     },
+    // Relative path for deep linking to the relevant workflow.
+    deepLink: {
+      type: String,
+      default: null,
+    },
+    // Stable reference IDs (never raw addresses, keys, or amounts).
+    promptId: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    promptTitle: {
+      type: String,
+      default: "",
+    },
+    // Type-specific supplemental fields (read-only, non-sensitive).
     versionIndex: {
       type: Number,
       default: 0,
@@ -108,11 +141,12 @@ const notificationSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+// Compound indexes for the notification center queries.
 notificationSchema.index({ recipientWallet: 1, read: 1, createdAt: -1 });
 notificationSchema.index(
   { dedupeKey: 1 },
   { unique: true, partialFilterExpression: { dedupeKey: { $type: "string" } } },
 );
 
-const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 export default Notification;
+export { NOTIFICATION_TYPES, notificationPreferencesSchema };

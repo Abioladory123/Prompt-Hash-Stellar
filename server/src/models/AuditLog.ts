@@ -70,6 +70,12 @@ const auditLogSchema = new mongoose.Schema(
       lowercase: true,
       index: true,
     },
+    // Who performed the action when it is not a wallet — e.g. the admin
+    // token subject for admin/moderation/dispute actions (#783).
+    actor: {
+      type: String,
+      default: null,
+    },
     requestId: {
       type: String,
       default: null,
@@ -83,6 +89,29 @@ const auditLogSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    // Target resource and type for ownership and access mutations
+    target: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    targetType: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    beforeState: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    afterState: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    metadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
     recordHash: {
       type: String,
       required: true,
@@ -91,6 +120,12 @@ const auditLogSchema = new mongoose.Schema(
     previousHash: {
       type: String,
       required: true,
+    },
+    // Hash algorithm used for `recordHash`. Records written before #783 have
+    // no value and are verified with the legacy (version 1) field set.
+    integrityVersion: {
+      type: Number,
+      default: null,
     },
     // Sensitive fields are NEVER stored — only stable reason codes above.
     // No plaintext, no keys, no raw signatures, no challenge secrets.
@@ -105,6 +140,11 @@ const auditLogSchema = new mongoose.Schema(
 auditLogSchema.index({ walletAddress: 1, createdAt: -1 });
 auditLogSchema.index({ promptId: 1, createdAt: -1 });
 auditLogSchema.index({ action: 1, result: 1, createdAt: -1 });
+// Filtered, chronological exports (#783).
+auditLogSchema.index({ createdAt: 1, _id: 1 });
+auditLogSchema.index({ actor: 1, createdAt: 1 });
+auditLogSchema.index({ target: 1, targetType: 1, createdAt: -1 });
+auditLogSchema.index({ targetType: 1, action: 1, createdAt: -1 });
 
 // Prevent updates — audit records are immutable.
 auditLogSchema.pre("findOneAndUpdate", function () {

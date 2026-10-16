@@ -1,17 +1,29 @@
-import os from "os";
-import { rpc as StellarRpc, scValToNative } from "@stellar/stellar-sdk";
+import { rpc, scValToNative } from "@stellar/stellar-sdk";
+import connectDb from "../db/connectDb";
 import Prompt from "../models/Prompt";
 import User from "../models/User";
 import Purchase from "../models/Purchase";
 import PriceChange from "../models/PriceChange";
 import { IndexerState } from "../models/IndexerState";
+import { MarketplaceIndex } from "../models/MarketplaceIndex";
 import ProcessedEvent from "../models/ProcessedEvent";
 import QuarantinedEvent from "../models/QuarantinedEvent";
 import { scanForSimilarity } from "./similarityDetection";
 import { enqueue as enqueueWebhookEvent } from "./webhookOutbox";
-import { cacheDel, cacheDelPattern, CACHE_KEYS } from "./cacheService";
-import { decodeEvent } from "../../../packages/sdk/src/events/decode.js";
+import {
+  cacheDel,
+  cacheDelPattern,
+  cacheGetJson,
+  cacheSetJson,
+  CACHE_KEYS,
+  invalidatePromptCaches,
+  METADATA_TTL_SECONDS,
+} from "./cacheService";
+import os from "os";
+import { decodeEvent } from "@prompthash/sdk";
 import { logger } from "./structuredLogger";
+import { applyDisputeTransition } from "./purchaseDisputes";
+import { trackBlockchainIndexing } from "../middleware/provenanceMiddleware";
 
 const POLL_INTERVAL_MS = 5_000;
 const LEASE_TTL_MS = 30_000; // lease expires after 30 s of inactivity
@@ -25,6 +37,24 @@ const ENTITLEMENT_CACHE_TTL_SECS = 30;
 
 async function invalidateEntitlementCacheForPrompt(promptId: string): Promise<void> {
   await cacheDelPattern(CACHE_KEYS.entitlementDecisionPattern(promptId));
+}
+
+/**
+ * Cached prompt metadata retrieval for indexing service to reduce DB / RPC overhead.
+ */
+export async function getCachedPromptMetadata<T>(promptId: string): Promise<T | null> {
+  return cacheGetJson<T>(CACHE_KEYS.promptMetadata(promptId));
+}
+
+/**
+ * Cache indexed prompt metadata.
+ */
+export async function cachePromptMetadata<T>(
+  promptId: string,
+  metadata: T,
+  ttlSeconds = METADATA_TTL_SECONDS,
+): Promise<void> {
+  await cacheSetJson(CACHE_KEYS.promptMetadata(promptId), metadata, ttlSeconds);
 }
 
 /**
@@ -43,38 +73,9 @@ async function ensureUser(walletAddress: string) {
   return user;
 }
 
-/**
- * Invalidates the marketplace read caches for a listing after an indexed
- * on-chain event changes it, so `GET /api/prompts` and per-prompt reads
- * regenerate a fresh ETag on the next request instead of serving stale data.
- */
-async function invalidatePromptCaches(promptId: string): Promise<void> {
-  await Promise.all([
-    cacheDelPattern("prompts:list:*"),
-    cacheDel(CACHE_KEYS.promptDetail(promptId)),
-  ]);
-}
 
-/**
- * Enqueues a durable webhook delivery for a creator/owner wallet, swallowing
- * enqueue errors so a webhook problem never blocks indexing. `dedupeKey` is
- * the chain event's own id — the indexer is the sole projector of on-chain
- * marketplace events into webhooks (#536), so this is a stable identity a
- * re-scanned ledger range can't double-enqueue.
- */
-async function notify(
-  wallet: string | undefined | null,
-  event: string,
-  data: Record<string, unknown>,
-  dedupeKey: string,
-): Promise<void> {
-  if (!wallet) return;
-  try {
-    await enqueueWebhookEvent(wallet, event, data, dedupeKey);
-  } catch (err) {
-    logger.error("Webhook enqueue failed", { action: "indexer", event, error: err });
-  }
-}
+const CONTRACT_ID = process.env.PUBLIC_PROMPT_HASH_CONTRACT_ID;
+const server = new rpc.Server(process.env.PUBLIC_STELLAR_RPC_URL!);
 
 /**
  * Main entry point to start the background indexing process.
@@ -84,16 +85,8 @@ async function notify(
  * transfers. Returns early (without starting the loop) when the required RPC /
  * contract configuration is missing, so it is safe to call unconditionally.
  */
-export async function startIndexer(): Promise<void> {
-  const rpcUrl = process.env.PUBLIC_STELLAR_RPC_URL;
-  const contractId = process.env.PUBLIC_PROMPT_HASH_CONTRACT_ID;
-
-  if (!rpcUrl || !contractId) {
-    logger.warn("Soroban indexer disabled - missing configuration", { action: "startIndexer" });
-    return;
-  }
-
-  const server = new StellarRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
+export async function startIndexer() {
+  await connectDb();
 
   const state = await IndexerState.findOneAndUpdate(
     { key: "prompt_hash_contract" },
@@ -101,45 +94,22 @@ export async function startIndexer(): Promise<void> {
     { upsert: true, new: true },
   );
 
-  logger.info("Soroban event indexer started", { action: "startIndexer", replicaId: REPLICA_ID });
+  logger.info("Soroban event indexer started", {
+    action: "startIndexer",
+    replicaId: REPLICA_ID,
+  });
 
   setInterval(async () => {
     // Single-flight: skip this tick if the previous one is still running.
     if (tickInFlight) {
-      logger.warn("Tick skipped - previous tick still in flight", { action: "indexerTick" });
+      logger.warn("Tick skipped - previous tick still in flight", {
+        action: "indexerTick",
+      });
       return;
     }
 
     tickInFlight = true;
     try {
-      // Acquire or renew the distributed lease via a compare-and-swap write.
-      // Only one replica holds the lease at a time; others skip their tick.
-      const now = new Date();
-      const leaseExpiry = new Date(now.getTime() + LEASE_TTL_MS);
-
-      const leased = await IndexerState.findOneAndUpdate(
-        {
-          key: "prompt_hash_contract",
-          $or: [
-            { leaseHolder: REPLICA_ID },                  // we already hold it
-            { leaseExpiresAt: { $lt: now } },             // it has expired
-            { leaseHolder: null },                        // nobody holds it
-          ],
-        },
-        {
-          $set: { leaseHolder: REPLICA_ID, leaseExpiresAt: leaseExpiry },
-          $inc: { fencingToken: 1 },
-        },
-        { new: true },
-      );
-
-      if (!leased) {
-        // Another replica holds a valid lease — yield this tick.
-        return;
-      }
-
-      const myToken = leased.fencingToken;
-
       const latestLedger = await server.getLatestLedger();
       const startLedger = (state.lastIndexedLedger || 0) + 1;
 
@@ -155,7 +125,7 @@ export async function startIndexer(): Promise<void> {
 
       for (const event of response.events) {
         // Skip provisional events — only process finalized transactions
-        if (event.inSuccessfulContractInvocation === false) {
+        if ((event as any).inSuccessfulContractInvocation === false || (event as any).inSuccessfulContractCall === false) {
           logger.debug("Skipping provisional event", { action: "processEvent", ledger: event.ledger });
           continue;
         }
@@ -165,9 +135,13 @@ export async function startIndexer(): Promise<void> {
 
       // Fence: only commit the checkpoint if we still hold the same lease epoch.
       // A stale replica that woke up after expiry is rejected here.
-      const current = await IndexerState.findOne({ key: "prompt_hash_contract" });
+      const current = await IndexerState.findOne({
+        key: "prompt_hash_contract",
+      });
       if (!current || current.fencingToken !== myToken) {
-        logger.warn("Fencing token mismatch - checkpoint discarded", { action: "indexerTick" });
+        logger.warn("Fencing token mismatch - checkpoint discarded", {
+          action: "indexerTick",
+        });
         return;
       }
 
@@ -192,7 +166,12 @@ export async function startIndexer(): Promise<void> {
  */
 export async function quarantineEvent(
   event: StellarRpc.Api.EventResponse,
-  reason: "unknown_type" | "unsupported_version" | "malformed_xdr" | "decoder_error" | "processing_error",
+  reason:
+    | "unknown_type"
+    | "unsupported_version"
+    | "malformed_xdr"
+    | "decoder_error"
+    | "processing_error",
   errorDetails?: string,
   rawTopic?: unknown,
   rawData?: unknown,
@@ -246,9 +225,30 @@ export async function processEvent(event: StellarRpc.Api.EventResponse): Promise
   let rawData: unknown;
 
   // 1. Defensively decode XDR to native types. If malformed, quarantine immediately.
+  if (
+    !event.topic ||
+    !Array.isArray(event.topic) ||
+    event.topic.length === 0 ||
+    event.topic[0] === null ||
+    event.topic[0] === undefined
+  ) {
+    await quarantineEvent(event, "malformed_xdr", "Missing or null event topic");
+    return;
+  }
+
   try {
-    rawTopic = scValToNative(event.topic[0]);
-    rawData = scValToNative(event.value);
+    rawTopic =
+      typeof (event.topic[0] as any)?.switch === "function"
+        ? scValToNative(event.topic[0])
+        : typeof event.topic[0] === "object" && event.topic[0] !== null && "value" in event.topic[0]
+          ? (event.topic[0] as any).value
+          : event.topic[0];
+    rawData =
+      event.value && typeof (event.value as any)?.switch === "function"
+        ? scValToNative(event.value)
+        : event.value !== null && typeof event.value === "object" && "value" in event.value
+          ? (event.value as any).value
+          : event.value;
   } catch (err: any) {
     await quarantineEvent(event, "malformed_xdr", err?.message || String(err));
     return;
@@ -276,9 +276,16 @@ export async function processEvent(event: StellarRpc.Api.EventResponse): Promise
   // 3. Decode event against schema
   let decoded;
   try {
-    decoded = decodeEvent(String(rawTopic), rawData);
+    const decodeFn = await getEventDecoder();
+    decoded = decodeFn(String(rawTopic), rawData);
   } catch (err: any) {
-    await quarantineEvent(event, "decoder_error", err?.message || String(err), rawTopic, rawData);
+    await quarantineEvent(
+      event,
+      "decoder_error",
+      err?.message || String(err),
+      rawTopic,
+      rawData,
+    );
     return;
   }
 
@@ -289,9 +296,21 @@ export async function processEvent(event: StellarRpc.Api.EventResponse): Promise
 
   // 4. Route decoded event to database projections
   try {
-    await routeDecodedEvent(decoded.type, decoded.data as Record<string, any>, event.id, txHash, event.ledger);
+    await routeDecodedEvent(
+      decoded.type,
+      decoded.data as Record<string, any>,
+      event.id,
+      txHash,
+      event.ledger,
+    );
   } catch (err: any) {
-    await quarantineEvent(event, "processing_error", err?.message || String(err), rawTopic, rawData);
+    await quarantineEvent(
+      event,
+      "processing_error",
+      err?.message || String(err),
+      rawTopic,
+      rawData,
+    );
   }
 }
 
@@ -315,9 +334,9 @@ export async function routeDecodedEvent(
 
       const user = await ensureUser(creator);
 
-      // handles discovery of prompts created off-platform
-      const upserted = await Prompt.findOneAndUpdate(
-        { onChainId: promptId },
+      // Upsert the prompt record (handles off-platform creation)
+      const prompt = await Prompt.findOneAndUpdate(
+        { onChainId: prompt_id.toString() },
         {
           $set: {
             onChainId: promptId,
@@ -329,17 +348,23 @@ export async function routeDecodedEvent(
         { upsert: true, new: true },
       );
 
-      // Record the initial price as the first entry in the price history.
-      await PriceChange.findOneAndUpdate(
-        { promptId, ledgerSeq: 0 },
+      // Mirror into the search index
+      await MarketplaceIndex.findOneAndUpdate(
+        { onChainId: prompt_id.toString() },
         {
           $set: {
-            promptId,
-            previousPrice: null,
-            newPrice: initialPrice,
-            asset: "XLM",
-            ledgerSeq: 0,
+            onChainId: prompt_id.toString(),
+            promptId: prompt._id,
+            title: prompt.title ?? "",
+            category: prompt.category ?? "Other",
+            price: Number(price_stroops) / 10_000_000,
+            ownerWallet: creator.toLowerCase(),
+            ownerUsername: user.username ?? "",
+            rating: prompt.rating ?? 1,
+            isActive: true,
+            image: prompt.image ?? "",
           },
+          $setOnInsert: { salesCount: 0 },
         },
         { upsert: true },
       );
@@ -347,10 +372,52 @@ export async function routeDecodedEvent(
       // Run similarity scan asynchronously — never block the indexer loop.
       if (upserted?.content) {
         const combinedText = `${upserted.title ?? ""} ${upserted.content}`;
-        scanForSimilarity(promptId, combinedText, upserted.category).catch((err) =>
-          logger.error("Similarity scan error", { action: "similarityScan", promptId, error: err }),
+        scanForSimilarity(promptId, combinedText, upserted.category).catch(
+          (err) =>
+            logger.error("Similarity scan error", {
+              action: "similarityScan",
+              promptId,
+              error: err,
+            }),
         );
       }
+
+      // Run the prompt safety scanner asynchronously (#758) — queued or
+      // blocked prompts are hidden from the public marketplace until a
+      // maintainer overrides. The encrypted payload never enters the scanner.
+      if (upserted) {
+        applySafetyScan(promptId, {
+          title: upserted.title,
+          description: upserted.description,
+          category: upserted.category,
+          tags: upserted.tags,
+          preview: upserted.preview,
+          payload: upserted.encryptedPrompt ?? undefined,
+        }).catch((err) =>
+          logger.error("Safety scan error", { action: "safetyScan", promptId, error: err }),
+        );
+      }
+
+      // Track blockchain provenance for on-chain prompts (#929) — creates
+      // a provenance record with blockchain source metadata. This runs
+      // asynchronously and must never block the indexer loop.
+      trackBlockchainIndexing(
+        String(prompt._id),
+        {
+          transactionHash: txHash,
+          ledgerNumber: ledger,
+          onChainId: promptId,
+          contractId: CONTRACT_ID,
+        },
+        creator,
+      ).catch((err) =>
+        logger.error("Provenance tracking error", {
+          action: "blockchainProvenance",
+          promptId,
+          error: err,
+        }),
+      );
+
       await invalidatePromptCaches(promptId);
       break;
     }
@@ -367,7 +434,7 @@ export async function routeDecodedEvent(
 
       if (buyer) {
         const buyerWallet = String(buyer).toLowerCase();
-        await Purchase.findOneAndUpdate(
+        const purchaseDoc = await Purchase.findOneAndUpdate(
           { promptId, buyerWallet, txHash: txHash ?? "" },
           {
             $set: {
@@ -378,12 +445,27 @@ export async function routeDecodedEvent(
               txHash: txHash ?? "",
             },
           },
-          { upsert: true },
+          { upsert: true, new: true },
+        );
+        // Freeze the license terms active at purchase time (#759).
+        // Fire-and-forget: snapshotting must never block or fail indexing.
+        snapshotLicenseForPurchase(
+          promptId,
+          buyerWallet,
+          String(purchaseDoc?._id ?? ""),
+        ).catch((err) =>
+          logger.error("license snapshot hook failed", {
+            action: "indexer",
+            promptId,
+            error: err,
+          }),
         );
       }
 
       const ownerWallet = (prompt?.owner as { walletAddress?: string } | null)
         ?.walletAddress;
+      const promptTitle = (prompt as { title?: string } | null)?.title ?? "";
+
       await notify(
         ownerWallet,
         "PromptPurchased",
@@ -395,6 +477,44 @@ export async function routeDecodedEvent(
         },
         eventId,
       );
+
+      // In-app notifications: buyer gets purchase_confirmed; creator gets
+      // a sale alert via the same event. Both use the on-chain event id as
+      // the idempotency key (suffixed per-wallet by fanOutNotification).
+      const buyerAddr = buyer ? String(buyer) : null;
+      if (buyerAddr) {
+        await createNotification({
+          recipientWallet: buyerAddr,
+          type: "purchase_confirmed",
+          message: `Your purchase of "${promptTitle || promptId}" was confirmed on-chain.`,
+          deepLink: `/prompts/${promptId}`,
+          promptId,
+          promptTitle,
+          idempotencyKey: `${eventId}:buyer:${buyerAddr.toLowerCase()}`,
+        }).catch((err) =>
+          logger.error("Failed to create purchase_confirmed notification", {
+            action: "indexer",
+            error: err,
+          }),
+        );
+      }
+      if (ownerWallet) {
+        await createNotification({
+          recipientWallet: ownerWallet,
+          type: "purchase_confirmed",
+          message: `Someone purchased your prompt "${promptTitle || promptId}".`,
+          deepLink: `/creator/analytics`,
+          promptId,
+          promptTitle,
+          idempotencyKey: `${eventId}:creator:${ownerWallet.toLowerCase()}`,
+        }).catch((err) =>
+          logger.error("Failed to create sale notification for creator", {
+            action: "indexer",
+            error: err,
+          }),
+        );
+      }
+
       await invalidatePromptCaches(promptId);
       await invalidateEntitlementCacheForPrompt(promptId);
       break;
@@ -418,35 +538,59 @@ export async function routeDecodedEvent(
         to: to ? String(to) : undefined,
         txHash,
       };
-      await notify(from ? String(from) : undefined, "PromptOwnershipTransferred", payload, eventId);
-      await notify(to ? String(to) : undefined, "PromptOwnershipTransferred", payload, eventId);
-      await invalidatePromptCaches(promptId);
+      await notify(
+        from ? String(from) : undefined,
+        "PromptOwnershipTransferred",
+        payload,
+        eventId,
+      );
+      await notify(
+        to ? String(to) : undefined,
+        "PromptOwnershipTransferred",
+        payload,
+        eventId,
+      );
+
+      // In-app notifications for both parties.
+      const transferredPrompt = await Prompt.findOne({
+        onChainId: promptId,
+      }).lean();
+      const transferTitle =
+        (transferredPrompt as { title?: string } | null)?.title ?? promptId;
+      await fanOutNotification(
+        [from ? String(from) : null, to ? String(to) : null],
+        {
+          type: "ownership_transfer",
+          message: `Ownership of "${transferTitle}" was transferred on-chain.`,
+          deepLink: `/prompts/${promptId}`,
+          promptId,
+          promptTitle: transferTitle,
+          idempotencyKey: eventId,
+        },
+      ).catch((err) =>
+        logger.error("Failed to create ownership_transfer notifications", {
+          action: "indexer",
+          error: err,
+        }),
+      );
+      await MarketplaceIndex.findOneAndUpdate(
+        { onChainId: prompt_id.toString() },
+        { $inc: { salesCount: 1 } },
+      );
       break;
     }
 
     case "PromptPriceUpdated": {
       const { prompt_id, price_stroops } = data;
-      const promptId = prompt_id.toString();
       const newPrice = Number(price_stroops) / 10_000_000;
-
-      const current = await Prompt.findOne({ onChainId: promptId });
-      const previousPrice = current?.price ?? null;
-
-      await Promise.all([
-        Prompt.findOneAndUpdate(
-          { onChainId: promptId },
-          { $set: { price: newPrice } },
-        ),
-        PriceChange.create({
-          promptId,
-          previousPrice,
-          newPrice,
-          asset: "XLM",
-          ledgerSeq: ledger ?? null,
-          txHash: txHash ?? "",
-        }),
-      ]);
-      await invalidatePromptCaches(promptId);
+      await Prompt.findOneAndUpdate(
+        { onChainId: prompt_id.toString() },
+        { $set: { price: newPrice } },
+      );
+      await MarketplaceIndex.findOneAndUpdate(
+        { onChainId: prompt_id.toString() },
+        { $set: { price: newPrice } },
+      );
       break;
     }
 
@@ -470,6 +614,19 @@ export async function routeDecodedEvent(
         { promptId, buyerWallet },
         { $set: { status: "disputed" } },
       );
+
+      // An on-chain dispute is the buyer's refund request for an off-chain
+      // dispute record, if one exists (#755). Keyed by event id so a replayed
+      // event is a no-op.
+      await applyDisputeTransition({
+        promptId,
+        buyerWallet,
+        event: "refund_requested",
+        actor: "indexer",
+        note: "Dispute opened on-chain",
+        eventKey: `chain:${eventId}`,
+        set: txHash ? { disputeTxHash: txHash } : undefined,
+      });
 
       invalidateEntitlementCacheForPrompt(promptId);
       await invalidatePromptCaches(promptId);
@@ -504,6 +661,20 @@ export async function routeDecodedEvent(
         },
       );
 
+      if (refunded) {
+        // Escrowed funds went back to the buyer: settle the off-chain dispute
+        // record too (#755). Idempotent if a maintainer already approved it.
+        await applyDisputeTransition({
+          promptId,
+          buyerWallet,
+          event: "refund_settled",
+          actor: "indexer",
+          note: "Refund settled on-chain",
+          eventKey: `chain:${eventId}`,
+          set: txHash ? { resolutionTxHash: txHash } : undefined,
+        });
+      }
+
       invalidateEntitlementCacheForPrompt(promptId);
       await invalidatePromptCaches(promptId);
 
@@ -518,6 +689,76 @@ export async function routeDecodedEvent(
         },
         eventId,
       );
+      break;
+    }
+
+    case "PromptUpdated": {
+      const { prompt_id, version } = data;
+      const promptId = prompt_id.toString();
+
+      if (version !== undefined) {
+        await Prompt.findOneAndUpdate(
+          { onChainId: promptId },
+          { $set: { currentVersionIndex: Number(version) } },
+        );
+      }
+
+      await invalidatePromptCaches(promptId);
+      logger.info("Prompt updated on-chain, invalidated caches", {
+        action: "processEvent",
+        topic: "PromptUpdated",
+        promptId,
+        version,
+      });
+      break;
+    }
+
+    case "ListingRevised": {
+      const { prompt_id, new_revision } = data;
+      const promptId = prompt_id.toString();
+
+      if (new_revision !== undefined) {
+        await Prompt.findOneAndUpdate(
+          { onChainId: promptId },
+          { $set: { currentRevision: Number(new_revision) } },
+        );
+      }
+
+      await invalidatePromptCaches(promptId);
+      logger.info("Listing revised, invalidated caches", {
+        action: "processEvent",
+        topic: "ListingRevised",
+        promptId,
+      });
+      break;
+    }
+
+    case "ListingExtended": {
+      const { prompt_id } = data;
+      const promptId = prompt_id.toString();
+      await invalidatePromptCaches(promptId);
+      break;
+    }
+
+    case "SplitsUpdated": {
+      const { prompt_id } = data;
+      const promptId = prompt_id.toString();
+      await invalidatePromptCaches(promptId);
+      break;
+    }
+
+    case "PromptMaxSupplyUpdated": {
+      const { prompt_id, max_supply } = data;
+      const promptId = prompt_id.toString();
+
+      if (max_supply !== undefined) {
+        await Prompt.findOneAndUpdate(
+          { onChainId: promptId },
+          { $set: { maxSupply: Number(max_supply) } },
+        );
+      }
+
+      await invalidatePromptCaches(promptId);
       break;
     }
 
@@ -590,3 +831,49 @@ export async function retryFailedIndexRefreshes(): Promise<{
 
   return { retried: failedPrompts.length, succeeded };
 }
+
+/**
+ * Replays quarantined events through the event decoder and database projections (#654).
+ */
+export async function replayQuarantinedEvents(options: { maxEvents?: number } = {}): Promise<{
+  replayed: number;
+  failed: number;
+}> {
+  const maxEvents = options.maxEvents || 100;
+  const quarantinedEvents = await QuarantinedEvent.find({ status: "quarantined" })
+    .sort({ ledger: 1, quarantinedAt: 1 })
+    .limit(maxEvents);
+
+  let replayed = 0;
+  let failed = 0;
+  const decodeFn = await getEventDecoder();
+
+  for (const item of quarantinedEvents) {
+    try {
+      const decoded = decodeFn(item.topic, item.rawValue);
+      if (decoded.recognized) {
+        await routeDecodedEvent(
+          decoded.type,
+          decoded.data as Record<string, any>,
+          item.eventId,
+          item.txHash,
+          item.ledger,
+        );
+        item.status = "replayed";
+        item.replayedAt = new Date();
+        await item.save();
+        replayed++;
+      } else {
+        failed++;
+      }
+    } catch (err: any) {
+      item.errorDetails = err?.message || String(err);
+      item.retryCount = (item.retryCount || 0) + 1;
+      await item.save();
+      failed++;
+    }
+  }
+
+  return { replayed, failed };
+}
+

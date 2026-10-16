@@ -20,3 +20,27 @@ export type {
   PromptStatus,
   PromptMetadataErrors,
 } from "./promptMetadata.js";
+export {
+  LIFECYCLE_STATES,
+  LIFECYCLE_TRANSITIONS,
+  PUBLIC_LIFECYCLE_STATES,
+  LifecycleTransitionError,
+  findTransition,
+  canTransition,
+  assertTransition,
+  availableTransitions,
+  deriveLifecycleState,
+} from "./lifecycle.js";
+export type { LifecycleState, LifecycleActorRole, LifecycleTransition } from "./lifecycle.js";
+export {
+  PERMALINK_STATUSES,
+  generateSlug,
+  buildCanonicalPermalink,
+  publicPromptSchema,
+  sanitizePromptRecord,
+} from "./permalink.js";
+export type {
+  PermalinkStatus,
+  SanitizedPublicPrompt,
+  PermalinkResolution,
+} from "./permalink.js";

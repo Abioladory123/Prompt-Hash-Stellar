@@ -215,7 +215,9 @@ describe("Prompt Versioning System", () => {
         txHash: "0x123abc",
       };
 
-      vi.spyOn(Prompt, "findById").mockResolvedValueOnce(mockPrompt);
+      vi.spyOn(Prompt, "findById").mockReturnValueOnce({
+        lean: vi.fn().mockResolvedValueOnce(mockPrompt),
+      } as any);
       vi.spyOn(Purchase, "findOne").mockResolvedValueOnce(null);
       vi.spyOn(Purchase, "create").mockResolvedValueOnce({
         promptId: mockPrompt._id.toString(),

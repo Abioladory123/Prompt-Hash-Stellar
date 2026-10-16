@@ -1,3 +1,4 @@
+import { PromptCard } from "../browse/PromptCard";
 import { useMemo, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useForm, Controller } from "react-hook-form";
@@ -34,10 +35,7 @@ import { useWallet } from "@/hooks/useWallet";
 import { useDraftAutoSave } from "@/hooks/useDraftAutoSave";
 import { usePayoutReadiness } from "@/hooks/usePayoutReadiness";
 import { unlockPublicKey } from "@/lib/env";
-import {
-  encryptPromptPlaintext,
-  wrapPromptKey,
-} from "@/lib/crypto/promptCrypto";
+import { encryptAndWrapPromptPayload } from "@/lib/crypto/promptCrypto";
 import { isIpfsUploadConfigured, uploadCiphertextToIpfs } from "@/lib/ipfs";
 import { browserStellarConfig } from "@/lib/stellar/browserConfig";
 import { xlmToStroops } from "@/lib/stellar/format";
@@ -46,17 +44,13 @@ import {
   findPromptByContentHash,
   PromptHashClient,
 } from "@/lib/stellar/promptHashClient";
-import { hashPromptPlaintext } from "@/lib/crypto/promptCrypto";
 import {
   LISTING_LIMITS,
   RevenueSplitFormInput,
   createPromptSchema,
 } from "@/lib/validation/listing";
 import { MarkdownContent } from "@/components/MarkdownContent";
-
-import { PromptCard } from "@/pages/browse/PromptCard";
-import type { PromptRecord } from "@/lib/stellar/promptHashClient";
-
+import { useUnsavedChangesWarning } from "@/hooks/useUnsavedChangesWarning";
 import { EncryptedPayloadSizeEstimator } from "@/components/sell/EncryptedPayloadSizeEstimator";
 import { estimateEncryptedPayloadSize } from "@/lib/crypto/payloadEstimator";
 import { getPrompt } from "@/lib/stellar/promptHashClient";
@@ -85,7 +79,6 @@ interface FormData {
   fullPrompt: string;
   priceXlm: string;
   tags: string[];
-  coCreators: RevenueSplitFormInput[];
 }
 
 interface CreatePromptFormProps {
@@ -127,23 +120,20 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       description: "",
       fullPrompt: "",
       priceXlm: "2",
-      coCreators: [],
     },
     mode: "onChange",
   });
 
   const watchAllFields = watch();
 
-  const {
-    draftRestored,
-    lastSavedAt,
-    discardDraft,
-    conflict,
-    resolveConflict,
-    sessionGuard,
-    resolveSessionGuard,
-    canPublish,
-  } = useDraftAutoSave({
+  const { isActive: hasUnsavedChanges, resetBlocker } = useUnsavedChangesWarning({
+    isDirty: Object.values(watchAllFields).some(
+      (v) => v !== "" && v !== undefined && v !== null && v !== "2" && !(Array.isArray(v) && v.length === 0)
+    ),
+    disabled: !!successMessage,
+  });
+
+  const { draftRestored, lastSavedAt, discardDraft, conflict, resolveConflict, sessionGuard, canPublish } = useDraftAutoSave({
     address,
     network,
     values: watchAllFields,
@@ -171,7 +161,6 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
           imageUrl: watchAllFields.imageUrl || "",
           category: watchAllFields.category || "",
           previewText: watchAllFields.previewText || "",
-          coCreators: watchAllFields.coCreators || [],
         },
         { offChainStorage },
       ),
@@ -219,8 +208,8 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     [watchAllFields.fullPrompt],
   );
 
-  const checkSimilarity = useCallback(
-    async (plaintext: string, category: string) => {
+  const checkDuplicate = useCallback(
+    async (title: string, plaintext: string, category: string) => {
       if (!plaintext.trim()) {
         setDuplicateWarning(null);
         return;
@@ -231,26 +220,26 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       setDuplicateConfirmed(false);
 
       try {
-        const response = await fetch("/api/prompts/similarity/check", {
+        const response = await fetch("/api/prompts/duplicate/check", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: plaintext, category }),
+          body: JSON.stringify({ title, content: plaintext, category }),
         });
 
         if (response.ok) {
           const result = await response.json();
-          if (result.flag === "highly_similar") {
+          if (result.severity === "exact") {
             setDuplicateWarning(
-              `This prompt is highly similar to an existing prompt (ID: ${result.similarTo}). Publishing is blocked to prevent plagiarism.`,
+              `This prompt is an exact duplicate of an existing prompt (ID: ${result.similarTo}). Publishing is blocked to prevent spam.`,
             );
-          } else if (result.flag === "suspicious") {
+          } else if (result.severity === "ambiguous") {
             setDuplicateWarning(
-              `This prompt is similar to an existing prompt (ID: ${result.similarTo}). It will be flagged for review if published.`,
+              `This prompt is suspiciously similar to an existing prompt (ID: ${result.similarTo}). It will be flagged for review if published.`,
             );
           }
         }
       } catch (e) {
-        console.error("Similarity check failed:", e);
+        console.error("Duplicate check failed:", e);
       } finally {
         setIsCheckingDuplicate(false);
       }
@@ -302,35 +291,38 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       return;
     }
 
-    // Ensure similarity check has run
-    let similarityFlag = "clean";
+    console.log("Form submitted successfully:", data);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    setSuccessMessage("Prompt listing created successfully!");
+    resetBlocker();
+    let severity = "none";
     try {
-      const response = await fetch("/api/prompts/similarity/check", {
+      const response = await fetch("/api/prompts/duplicate/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: data.fullPrompt, category: data.category }),
+        body: JSON.stringify({ title: data.title, content: data.fullPrompt, category: data.category }),
       });
       if (response.ok) {
         const result = await response.json();
-        similarityFlag = result.flag;
+        severity = result.severity;
       }
     } catch (e) {
-      console.error("Failed to check similarity before publish", e);
+      console.error("Failed to check duplicate before publish", e);
     }
 
-    if (similarityFlag === "highly_similar") {
+    if (severity === "exact") {
       setSubmitError(
-        "Publishing is blocked. This prompt is highly similar to an existing prompt (plagiarism).",
+        "Publishing is blocked. This prompt is an exact duplicate of an existing prompt (spam).",
       );
       return;
     }
 
-    if (similarityFlag === "suspicious" && !duplicateConfirmed) {
+    if (severity === "ambiguous" && !duplicateConfirmed) {
       setDuplicateWarning(
         "This prompt is suspiciously similar to an existing prompt. Confirm below to proceed (will be sent to review).",
       );
       setSubmitError(
-        "Review similarity warning before proceeding.",
+        "Review duplicate warning before proceeding.",
       );
       return;
     }
@@ -349,12 +341,9 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       }
 
       // Encrypt the prompt content
-      const encryptionResult = await encryptPromptPlaintext(
+      const encryptionResult = await encryptAndWrapPromptPayload(
         data.fullPrompt,
-        unlockPublicKey,
       );
-
-      const hash = await hashPromptPlaintext(data.fullPrompt);
 
       // Build the contract creation payload
       const createInput = {
@@ -362,10 +351,10 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         title: data.title,
         category: data.category,
         previewText: data.previewText,
-        encryptedPrompt: encryptionResult.ciphertext,
-        encryptionIv: encryptionResult.iv,
+        encryptedPrompt: encryptionResult.encryptedPrompt,
+        encryptionIv: encryptionResult.encryptionIv,
         wrappedKey: encryptionResult.wrappedKey,
-        contentHash: hash,
+        contentHash: encryptionResult.contentHash,
         priceStroops: BigInt(xlmToStroops(Number(data.priceXlm) || 0)),
         splits: (data.coCreators || [])
           .filter((cc: any) => cc.address?.trim())
@@ -376,15 +365,21 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       };
 
       // Call the contract
+      const signer: any = {
+        signTransaction: async (xdr: string, opts: any) => ({
+          signedTxXdr: await signTransaction(xdr, opts),
+        }),
+      };
+
       const result = await PromptHashClient.createPrompt(
         browserStellarConfig,
-        { signTransaction },
+        signer,
         address,
         createInput,
       );
 
       if (result.success) {
-        if (sourcePromptId) {
+        if (sourcePromptId && result.promptId !== undefined) {
           saveRemixAttribution(result.promptId, sourcePromptId);
         }
         setSuccessMessage(`Prompt created! Transaction: ${result.txHash}`);
@@ -892,7 +887,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
           {watchAllFields.fullPrompt && (
             <button
               type="button"
-              onClick={() => checkSimilarity(watchAllFields.fullPrompt, watchAllFields.category)}
+              onClick={() => checkDuplicate(watchAllFields.title, watchAllFields.fullPrompt, watchAllFields.category)}
               disabled={isCheckingDuplicate}
               className="mt-2 flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200"
             >

@@ -13,6 +13,7 @@ import {
   GetPriceHistory,
   GetPromptsByContentHash,
   CheckSimilarity,
+  CheckDuplicate,
 } from "../controllers/controllers";
 import {
   GetCreatorSalesAnalytics,
@@ -28,8 +29,18 @@ import {
   RespondOwnershipTransfer,
   CancelOwnershipTransfer,
 } from "../controllers/transferControllers";
+import { GetModerationQueue, OverrideModeration } from "../services/moderationService";
+import {
+  GetLicenseTemplates,
+  GetPromptLicense,
+  GetPurchaseReceipt,
+  GetLicenseDisputeView,
+  UpdatePromptLicense,
+} from "../controllers/licensingControllers";
 import { requireAdminScope } from "../middleware/adminAuth";
 import { reportLimiter, publishLimiter } from "../middleware/rateLimiter";
+import { enforcePolicyLimit } from "../middleware/policyLimitMiddleware";
+import { requireIdempotency } from "../middleware/idempotency";
 
 export const promptRouter = express.Router();
 
@@ -61,21 +72,39 @@ promptRouter.get("/buyer/:walletAddress/owned", GetOwnedPrompts);
 promptRouter.get("/buyer/:walletAddress/saved", GetSavedPrompts);
 promptRouter.get("/buyer/:walletAddress/transactions", GetPurchaseTransactions);
 promptRouter.get("/creator/:walletAddress/analytics", GetCreatorSalesAnalytics);
-promptRouter.get(
-  "/creator/:walletAddress/analytics/support-metrics",
-  GetCreatorSupportMetrics,
-);
-promptRouter.get(
-  "/creator/:walletAddress/payout-statement",
-  GetCreatorPayoutStatement,
-);
+promptRouter.get("/creator/:walletAddress/payout-statement", GetCreatorPayoutStatement);
 promptRouter.get("/creator/:walletAddress/drafts", GetDraftPrompts);
+
+// ── Safe Public Permalinks (#936) ───────────────────────────────────────────
+// Canonical permalink resolution, redirect handling for renamed records, and
+// safe public views for archived/restricted records.
+promptRouter.get("/permalink/:identifier", ResolvePromptPermalink);
+promptRouter.get("/resolve/:identifier", ResolvePromptPermalink);
+promptRouter.post("/:promptId/rename", RenamePromptRecord);
+promptRouter.post("/:promptId/archive-permalink", ArchivePromptRecord);
+promptRouter.post("/:promptId/restore-permalink", RestorePromptRecord);
+promptRouter.post(
+  "/:promptId/restrict-permalink",
+  requireAdminScope("moderation:write"),
+  RestrictPromptRecord
+);
 
 // Content hash lookup for duplicate detection (#333)
 promptRouter.get("/hash/:contentHash", GetPromptsByContentHash);
 
 // Semantic similarity check for anti-plagiarism
-promptRouter.post("/similarity/check", CheckSimilarity);
+promptRouter.post(
+  "/similarity/check",
+  enforcePolicyLimit("COMPUTE_SIMILARITY_CHECK"),
+  CheckSimilarity
+);
+
+// Duplicate check
+promptRouter.post(
+  "/duplicate/check",
+  enforcePolicyLimit("COMPUTE_SIMILARITY_CHECK"),
+  CheckDuplicate
+);
 
 // Preview analytics (#257)
 promptRouter.post("/preview", RecordPreview);
@@ -100,10 +129,39 @@ promptRouter.get(
   requireAdminScope("integrity:read"),
   GetIntegrityReport,
 );
+promptRouter.post("/admin/integrity-check", requireAdminScope("integrity:write"), TriggerIntegrityCheck);
+
+// ── Safety scanner moderation (#758) — maintainer override workflow ──────────
+// The scanner queues (never publishes/blocks unilaterally); a maintainer with
+// a moderation-scoped admin token approves or rejects. Every decision is
+// appended to the ModerationReview history and the audit trail. Hidden-payload
+// fields are excluded from every moderation response.
+promptRouter.get(
+  "/moderation/queue",
+  requireAdminScope("moderation:read"),
+  GetModerationQueue,
+);
 promptRouter.post(
-  "/admin/integrity-check",
-  requireAdminScope("integrity:write"),
-  TriggerIntegrityCheck,
+  "/moderation/:promptId/override",
+  requireAdminScope("moderation:write"),
+  OverrideModeration,
+);
+
+// ── Versioned prompt licensing (#759) ────────────────────────────────────────
+// License terms are versioned; purchases freeze an immutable snapshot at
+// purchase time so later edits never rewrite historical terms. Receipts are
+// wallet-scoped (private); the dispute view is admin-only for reviewers.
+promptRouter.get("/licensing/templates", GetLicenseTemplates);
+promptRouter.get("/:promptId/license", GetPromptLicense);
+promptRouter.post("/licensing/update", requireIdempotency, UpdatePromptLicense);
+promptRouter.get(
+  "/buyer/:walletAddress/receipts/:promptId",
+  GetPurchaseReceipt,
+);
+promptRouter.get(
+  "/admin/licensing/:walletAddress/disputes/:promptId",
+  requireAdminScope("moderation:read"),
+  GetLicenseDisputeView,
 );
 
 // ── Ownership transfer (#708) — OFF-CHAIN two-phase handoff ───────────────────
@@ -112,10 +170,10 @@ promptRouter.post(
 // and the recipient approves or rejects it. Approval re-points the indexed
 // Prompt.owner (affects analytics/payout attribution). Both actions require a
 // wallet signature. See docs/architecture.md before extending this surface.
-promptRouter.post("/transfers/request", RequestOwnershipTransfer);
+promptRouter.post("/transfers/request", requireIdempotency, RequestOwnershipTransfer);
 promptRouter.get("/transfers/:walletAddress", GetOwnershipTransfers);
-promptRouter.post("/transfers/:transferId/respond", RespondOwnershipTransfer);
-promptRouter.post("/transfers/:transferId/cancel", CancelOwnershipTransfer);
+promptRouter.post("/transfers/:transferId/respond", requireIdempotency, RespondOwnershipTransfer);
+promptRouter.post("/transfers/:transferId/cancel", requireIdempotency, CancelOwnershipTransfer);
 
 // ── User Preference (non-authoritative, wallet-signature required) ────────────
 promptRouter.post("/buyer/save", SavePrompt);

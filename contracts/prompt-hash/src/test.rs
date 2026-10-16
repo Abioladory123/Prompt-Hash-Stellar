@@ -3300,7 +3300,11 @@ fn test_buy_bundle_price_allocation_evenly_divisible_unchanged() {
         (pa, pb)
     });
 
-    assert_eq!(price_a + price_b, bundle_price, "evenly-split prices must sum to bundle price");
+    assert_eq!(
+        price_a + price_b,
+        bundle_price,
+        "evenly-split prices must sum to bundle price"
+    );
     assert_eq!(price_a, 6_000, "first prompt gets equal share");
     assert_eq!(price_b, 6_000, "second prompt gets equal share");
 }
@@ -5238,6 +5242,78 @@ fn test_creator_can_settle_immediately_without_waiting() {
 // ---------- Per-asset escrow liability tests (#570) ----------
 
 #[test]
+fn test_revenue_rounding_carries_fractional_shares_into_reserved_payouts() {
+    let env: Env = Default::default();
+    let context = setup(&env);
+    let client = PromptHashContractClient::new(&env, &context.contract);
+    let xlm_client = token::StellarAssetClient::new(&env, &context.xlm);
+    let creator = Address::generate(&env);
+    let collaborator = Address::generate(&env);
+    let prompt_id = create_prompt_with_splits(
+        &env,
+        &client,
+        &creator,
+        "Fractional shares",
+        1,
+        &context.xlm,
+        Vec::from_array(
+            &env,
+            [crate::types::Split {
+                recipient: collaborator.clone(),
+                bps: 2_000,
+            }],
+        ),
+    );
+
+    for round in 0..20 {
+        let buyer = Address::generate(&env);
+        fund_buyer(&xlm_client, &buyer, &context.contract, 1);
+        client.buy_prompt(&buyer, &prompt_id, &None::<Address>, &1, &None::<Bytes>);
+        client.settle_purchase(&context.admin, &prompt_id, &buyer);
+
+        if round == 0 {
+            let first_report = client.get_revenue_rounding_report(&context.xlm);
+            assert_eq!(first_report.reserve_stroops, 1);
+            let solvency = client.get_asset_solvency(&context.xlm);
+            assert_eq!(solvency.tracked_liability, 1);
+            assert_eq!(solvency.actual_balance, 1);
+            assert_eq!(solvency.surplus, 0);
+        }
+    }
+
+    let report = client.get_revenue_rounding_report(&context.xlm);
+    assert_eq!(report.reserve_stroops, 0);
+    assert_eq!(report.cumulative_numerator, 200_000);
+    assert_eq!(xlm_client.balance(&context.fee_wallet), 1);
+    assert_eq!(xlm_client.balance(&collaborator), 4);
+    assert_eq!(xlm_client.balance(&creator), 15);
+}
+
+#[test]
+fn test_refunded_escrow_does_not_accrue_rounding_carry() {
+    let env: Env = Default::default();
+    let context = setup(&env);
+    let client = PromptHashContractClient::new(&env, &context.contract);
+    let xlm_client = token::StellarAssetClient::new(&env, &context.xlm);
+    let creator = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let prompt_id = create_prompt(&env, &client, &creator, "Refunded fraction", 1, &context.xlm);
+
+    fund_buyer(&xlm_client, &buyer, &context.contract, 1);
+    client.buy_prompt(&buyer, &prompt_id, &None::<Address>, &1, &None::<Bytes>);
+    client.open_dispute(
+        &buyer,
+        &prompt_id,
+        &crate::types::DisputeReason::FailedIntegrityVerification,
+    );
+    client.resolve_dispute(&context.admin, &prompt_id, &buyer, &true);
+
+    let report = client.get_revenue_rounding_report(&context.xlm);
+    assert_eq!(report.cumulative_numerator, 0);
+    assert_eq!(report.reserve_stroops, 0);
+}
+
+#[test]
 fn test_asset_liability_tracks_pending_on_purchase() {
     let env: Env = Default::default();
     let context = setup(&env);
@@ -6799,7 +6875,7 @@ fn test_get_prompts_by_buyer_paginated_multi_page() {
     fund_buyer(&xlm_client, &buyer, &context.contract, 50_000);
 
     let mut created_ids = Vec::new(&env);
-    for i in 0..5 {
+    for _i in 0..5 {
         let p_id = create_prompt(&env, &client, &creator, "Prompt", 1_000, &context.xlm);
         created_ids.push_back(p_id);
         client.buy_prompt(&buyer, &p_id, &None, &1_000, &None);
@@ -6835,7 +6911,14 @@ fn test_catalog_secondary_index_verification_and_repair() {
     let client = PromptHashContractClient::new(&env, &context.contract);
 
     let creator = Address::generate(&env);
-    let prompt_id = create_prompt(&env, &client, &creator, "Indexed Prompt", 1_000, &context.xlm);
+    let _prompt_id = create_prompt(
+        &env,
+        &client,
+        &creator,
+        "Indexed Prompt",
+        1_000,
+        &context.xlm,
+    );
 
     // Initial state: healthy indexes
     let report = client.verify_catalog_indexes(&0, &50);
@@ -6848,8 +6931,12 @@ fn test_catalog_secondary_index_verification_and_repair() {
     // Fault injection: simulate drift by clearing AllPrompts and ActivePrompts
     env.as_contract(&context.contract, || {
         let empty_vec: Vec<u64> = Vec::new(&env);
-        env.storage().persistent().set(&DataKey::AllPrompts, &empty_vec);
-        env.storage().persistent().set(&DataKey::ActivePrompts, &empty_vec);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllPrompts, &empty_vec);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActivePrompts, &empty_vec);
     });
 
     // Detect drift
@@ -6896,7 +6983,14 @@ fn test_checked_accounting_invariant_on_double_refund_and_counters() {
     let creator = Address::generate(&env);
     let buyer = Address::generate(&env);
 
-    let prompt_id = create_prompt(&env, &client, &creator, "Unique Prompt", 2_000, &context.xlm);
+    let prompt_id = create_prompt(
+        &env,
+        &client,
+        &creator,
+        "Unique Prompt",
+        2_000,
+        &context.xlm,
+    );
     fund_buyer(&xlm_client, &buyer, &context.contract, 10_000);
 
     client.buy_prompt(&buyer, &prompt_id, &None, &2_000, &None);
@@ -6905,14 +6999,19 @@ fn test_checked_accounting_invariant_on_double_refund_and_counters() {
     assert_eq!(prompt_after_buy.sales_count, 1);
 
     // Open dispute and refund
-    client.open_dispute(&buyer, &prompt_id, &DisputeReason::FailedIntegrityVerification);
+    client.open_dispute(
+        &buyer,
+        &prompt_id,
+        &DisputeReason::FailedIntegrityVerification,
+    );
     client.resolve_dispute(&context.admin, &prompt_id, &buyer, &true);
 
     let prompt_after_refund = client.get_prompt(&prompt_id);
     assert_eq!(prompt_after_refund.sales_count, 0);
 
     // Attempting a second refund / dispute resolution on an already resolved dispute must fail
-    let double_resolve_result = client.try_resolve_dispute(&context.admin, &prompt_id, &buyer, &true);
+    let double_resolve_result =
+        client.try_resolve_dispute(&context.admin, &prompt_id, &buyer, &true);
     assert!(double_resolve_result.is_err());
 
     // Reconcile sales counter
@@ -6927,17 +7026,29 @@ fn test_listing_snapshot_hash_binds_to_current_listing_state() {
     let client = PromptHashContractClient::new(&env, &context.contract);
 
     let creator = Address::generate(&env);
-    let prompt_id =
-        create_prompt(&env, &client, &creator, "Snapshot Prompt", 10_000_000, &context.xlm);
+    let prompt_id = create_prompt(
+        &env,
+        &client,
+        &creator,
+        "Snapshot Prompt",
+        10_000_000,
+        &context.xlm,
+    );
 
     let h1 = client.listing_snapshot_hash(&prompt_id);
     let h1_b = client.listing_snapshot_hash(&prompt_id);
-    assert_eq!(h1, h1_b, "snapshot hash must be deterministic for a stable listing");
+    assert_eq!(
+        h1, h1_b,
+        "snapshot hash must be deterministic for a stable listing"
+    );
 
     // A price change must invalidate any challenge bound to the prior snapshot.
     client.update_prompt_price(&creator, &prompt_id, &20_000_000);
     let h2 = client.listing_snapshot_hash(&prompt_id);
-    assert_ne!(h1, h2, "snapshot hash must change when the listing price drifts");
+    assert_ne!(
+        h1, h2,
+        "snapshot hash must change when the listing price drifts"
+    );
 
     // verify_listing_snapshot only matches the current listing state.
     assert!(!client.verify_listing_snapshot(&prompt_id, &h1));
@@ -7031,4 +7142,3 @@ fn test_admin_moderation_delist_restore_and_evidence_audit_trail() {
     assert_eq!(restore_record.policy_reference, evidence_ref_2);
     assert_eq!(restore_record.reverses_timestamp, delist_timestamp);
 }
-
