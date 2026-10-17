@@ -26,6 +26,16 @@ type ExtendedRequest = VercelRequest & {
   requestId?: string | null;
 };
 
+/**
+ * Actions this public endpoint may sign (#963). Its tokens share
+ * CHALLENGE_TOKEN_SECRET with server-owned tokens (wallet sessions and
+ * identity-link challenges) that verifiers tell apart only by `action`. A
+ * wallet session is a bearer token that needs no wallet signature, so minting
+ * one here would let anyone act as any wallet. Default-deny: only actions a
+ * public client legitimately requests are allowed.
+ */
+const PUBLIC_CHALLENGE_ACTIONS: ReadonlySet<string> = new Set(["unlock"]);
+
 /* eslint-disable no-unused-vars */
 export interface ChallengeRequest {
   address: string;
@@ -145,6 +155,23 @@ async function handler(
       "address and promptId are required.",
       { status: 400 },
     );
+    return;
+  }
+
+  if (!PUBLIC_CHALLENGE_ACTIONS.has(String(action))) {
+    req.logger.warn({ action }, "Refused challenge for a non-public action");
+    void recordAuditEvent({
+      action: "challenge_issued",
+      result: "blocked",
+      promptId: String(promptId),
+      walletAddress: String(address),
+      requestId: req.requestId ?? null,
+      clientIp,
+      reason: "unsupported_action",
+    });
+    res
+      .status(400)
+      .json(apiError(ErrorCode.CHALLENGE_INVALID, "Unsupported challenge action."));
     return;
   }
 
