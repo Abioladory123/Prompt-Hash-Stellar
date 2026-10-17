@@ -31,6 +31,11 @@ import { externalIdentityRouter } from "./routes/externalIdentityRoutes";
 import { abuseRiskRouter } from "./routes/abuseRiskRoutes";
 import { retentionHoldRouter } from "./routes/retentionHoldRoutes";
 import { lifecycleCaptureRouter, lifecycleReportRouter } from "./routes/lifecycleAnalyticsRoutes";
+import { adminRateLimitRouter } from "./routes/adminRateLimitRoutes";
+import { supportAccessRouter } from "./routes/supportAccessRoutes";
+import { payoutLedgerRouter } from "./routes/payoutLedgerRoutes";
+import { entitlementRouter } from "./routes/entitlementRoutes";
+import { bundleRouter } from "./routes/bundleRoutes";
 import {
   GetOpenApiSchema,
   GetOpenApiExplorer,
